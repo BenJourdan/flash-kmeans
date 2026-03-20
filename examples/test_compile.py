@@ -11,7 +11,7 @@ import time
 
 def _measure_worker(n: int, d: int, k: int, rounds: int, dtype: str, use_heuristic: bool):
     import torch
-    from flash_kmeans import batch_kmeans_Euclid
+    from flash_kmeans import batch_mini_batch_kmeans_Euclid
 
     dtype_map = {"fp16": torch.float16, "fp32": torch.float32}
     torch_dtype = dtype_map[dtype]
@@ -22,7 +22,7 @@ def _measure_worker(n: int, d: int, k: int, rounds: int, dtype: str, use_heurist
 
     torch.cuda.synchronize()
     start_time = time.time()
-    cluster_ids, centers, _ = batch_kmeans_Euclid(
+    cluster_ids, centers, _ = batch_mini_batch_kmeans_Euclid(
         x,
         n_clusters=k,
         tol=0.0,
@@ -38,7 +38,7 @@ def _measure_worker(n: int, d: int, k: int, rounds: int, dtype: str, use_heurist
     end_evt = torch.cuda.Event(enable_timing=True)
     start_evt.record()
     for _ in range(rounds):
-        cluster_ids, centers, _ = batch_kmeans_Euclid(
+        cluster_ids, centers, _ = batch_mini_batch_kmeans_Euclid(
             x,
             n_clusters=k,
             tol=0.0,

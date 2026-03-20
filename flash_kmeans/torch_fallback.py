@@ -134,7 +134,7 @@ def _euclid_iter_torch_naive(x, x_sq, centroids, chunk_size_N=32768, chunk_size_
     
     return centroids_new, shift, cluster_ids
 
-def batch_kmeans_Euclid_torch_native(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False, chunk_size_N=32768, chunk_size_K=1024):
+def batch_kmeans_Euclid_torch_native(x, n_clusters, max_iters=100, tol=None, init_centroids=None, verbose=False, chunk_size_N=32768, chunk_size_K=1024):
     """
     Batched KMeans clustering in PyTorch using Euclidean distance.
 
@@ -142,7 +142,7 @@ def batch_kmeans_Euclid_torch_native(x, n_clusters, max_iters=100, tol=0.0, init
         x: Tensor of shape (B, N, D), batch_size B, N points per batch, D dims.
         n_clusters: Number of clusters.
         max_iters: Max number of iterations.
-        tol: Relative tolerance for center movement.
+        tol: Relative tolerance for center movement. Use None to disable early stopping.
         verbose: Print loss for each iter.
     Returns:
         cluster_ids: (B, N) LongTensor, cluster assignment for each point.
@@ -171,9 +171,9 @@ def batch_kmeans_Euclid_torch_native(x, n_clusters, max_iters=100, tol=0.0, init
 
         if verbose:
             print(f"Iter {it}, center shift: {center_shift.item():.6f}")
-        if center_shift < tol:
+        if tol is not None and center_shift < tol:
             break
-        centroids = centroids_new.clone()
+        centroids = centroids_new
 
     return cluster_ids, centroids, it + 1
 
@@ -199,8 +199,6 @@ if __name__ == "__main__":
     impl_ids = euclid_assign_torch_native_chunked(x, cent, x_sq) 
 
     # torch.testing.assert_close(ref_ids.to(torch.float32), impl_ids.to(torch.float32))
-
-
 
 
 

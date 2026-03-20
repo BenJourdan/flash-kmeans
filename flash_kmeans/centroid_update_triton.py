@@ -362,6 +362,98 @@ def triton_centroid_update_sorted_euclid(x: torch.Tensor, cluster_ids: torch.Ten
         return centroids.to(x.dtype)
     else:
         return None
+    
+
+def triton_centroid_update_sorted_mini_batch_euclid(
+        x_mb: torch.Tensor, 
+        cluster_ids_mb: torch.Tensor, 
+        old_centroids: torch.Tensor,
+        alpha: torch.Tensor,
+        *, 
+        BLOCK_N: int = 256,
+        calculate_new: bool = True
+    ):
+    """Fast centroid update for *Euclidean* Mini-Batch KMeans assuming batch cluster IDs are pre-sorted.
+
+    Parameters
+    ----------
+    x_mb : Tensor [B, N, D]
+        Input feature vectors for the mini-batch (no normalization assumed).
+    cluster_ids_mb : LongTensor [B, N]
+        Cluster assignment for each point.
+    old_centroids : Tensor [B, K, D]
+        Previous centroids (used to fill empty clusters).
+    alpha : Tensor [B, K]
+        Learning rate for updating centroids
+    BLOCK_N : int, optional
+        Tokens per Triton program (affects occupancy/perf).
+    calculate_new : bool, default=True
+        If True, compute and return the new centroids.  If False, only update the
+        accumulation buffers.
+
+    Returns
+    _________
+        centroids_new : Tensor [B, K, D] or None
+            Updated centroids if `calculate_new` is True; otherwise None.
+    """
+    assert x_mb.is_cuda and cluster_ids_mb.is_cuda, "Inputs must be on CUDA device"
+
+    # Note that N here is the mini-batch size, not the full dataset size.
+    B, N, D = x_mb.shape
+    K = old_centroids.shape[1]
+
+    # Batch-wise sort of cluster assignments
+    sorted_cluster_mb_ids, sorted_idx = torch.sort(cluster_ids_mb, dim=-1)
+    sorted_idx_mb_int = sorted_idx.to(torch.int32)
+
+    centroid_mb_sums = torch.zeros((B, K, D), device=x_mb.device, dtype=torch.float32)
+    centroid_mb_cnts = torch.zeros((B, K),    device=x_mb.device, dtype=torch.int32)
+
+
+    grid = (triton.cdiv(N, BLOCK_N), B)
+    _centroid_update_chunk_kernel[grid](
+        x_mb,                       # original features
+        sorted_idx_mb_int,          # gather indices
+        sorted_cluster_mb_ids.to(torch.int32),
+        centroid_mb_sums,
+        centroid_mb_cnts,
+        x_mb.stride(0), x_mb.stride(1), x_mb.stride(2),
+        sorted_idx_mb_int.stride(0), sorted_idx_mb_int.stride(1),
+        sorted_cluster_mb_ids.stride(0), sorted_cluster_mb_ids.stride(1),
+        centroid_mb_sums.stride(0), centroid_mb_sums.stride(1), centroid_mb_sums.stride(2),
+        centroid_mb_cnts.stride(0), centroid_mb_cnts.stride(1),
+        B, N, D, K,
+        BLOCK_N=BLOCK_N,
+    )
+
+    if calculate_new:
+        old_centroids_f = old_centroids.to(torch.float32)
+
+        batch_counts_f = centroid_mb_cnts.to(torch.float32)
+        batch_means = centroid_mb_sums / batch_counts_f.clamp_min(1.0).unsqueeze(-1)
+
+        alpha_f = alpha.to(torch.float32).unsqueeze(-1)
+        moved_mask = (centroid_mb_cnts > 0).unsqueeze(-1)
+
+        centroids_new = torch.where(
+            moved_mask,
+            torch.lerp(old_centroids_f, batch_means, alpha_f),
+            old_centroids_f,
+        )
+        return centroids_new.to(x_mb.dtype)
+    else:
+        return None
+
+    # if calculate_new:
+    #     # Convert sums to means; replace empty clusters with old centroids
+    #     counts_mb_f = centroid_mb_cnts.to(torch.float32).unsqueeze(-1).clamp(min=1.0)
+    #     centroids = centroid_mb_sums / counts_mb_f
+    #     empty_mask = (centroid_mb_cnts == 0).unsqueeze(-1)
+    #     centroids = torch.where(empty_mask, old_centroids.to(torch.float32), centroids)
+    #     return centroids.to(x_mb.dtype)
+    # else:
+    #     return None
+
 # ------------------------------ END new implementation ------------------------------
 
 

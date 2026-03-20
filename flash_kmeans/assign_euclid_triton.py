@@ -24,8 +24,8 @@ def _ceil_div(a: int, b: int) -> int:
 
 _TUNE_CONFIGS = [
     triton.Config({"BLOCK_N": BN, "BLOCK_K": BK}, num_stages=num_stages, num_warps=wp)
-    for BN in [32, 64, 128]
-    for BK in [32, 64, 128]
+    for BN in [4, 8, 16, 32, 64, 128]
+    for BK in [4, 8, 16, 32, 64, 128]
     for wp in [4, 8]
     for num_stages in [1, 2, 4]
 ]
@@ -59,6 +59,23 @@ def _heuristic_euclid_config(
     if device is None:
         device = torch.device("cuda")
     gpu_name = torch.cuda.get_device_properties(device).name.upper()
+
+    # Current assign kernels stage the full feature dimension, so high-D shapes
+    # need tiny tiles to stay within shared-memory limits.
+    if D >= 768:
+        return {
+            "BLOCK_N": 16,
+            "BLOCK_K": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
+    if D >= 512:
+        return {
+            "BLOCK_N": 32,
+            "BLOCK_K": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
 
     if "H200" in gpu_name:
         # Keep the original H200 heuristic as-is.
@@ -327,6 +344,100 @@ def _euclid_assign_kernel(
 
 _euclid_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])(_euclid_assign_kernel)
 
+
+@triton.jit
+def _mini_batch_euclid_assign_kernel(
+    x_ptr,                 # *f16 / *f32 [B, N, D]
+    c_ptr,                 # *f16 / *f32 [B, K, D]
+    x_sq_ptr,              # *f32         [B, N]
+    c_sq_ptr,              # *f32         [B, K]
+    out_ptr,               # *i32         [B, N]
+    inertia_ptr,           # *f32         [B]
+    B: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    stride_x_b: tl.constexpr,
+    stride_x_n: tl.constexpr,
+    stride_x_d: tl.constexpr,
+    stride_c_b: tl.constexpr,
+    stride_c_k: tl.constexpr,
+    stride_c_d: tl.constexpr,
+    stride_xsq_b: tl.constexpr,
+    stride_xsq_n: tl.constexpr,
+    stride_csq_b: tl.constexpr,
+    stride_csq_k: tl.constexpr,
+    stride_out_b: tl.constexpr,
+    stride_out_n: tl.constexpr,
+    stride_inertia_b: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Mini-batch Euclidean assignment with per-batch inertia accumulation."""
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_b = pid_b.to(tl.int64)
+
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N)
+    n_offsets = n_offsets.to(tl.int64)
+    n_mask = n_offsets < N
+
+    offs_d = tl.arange(0, D).to(tl.int64)
+    x_ptrs = (
+        x_ptr
+        + pid_b * stride_x_b
+        + n_offsets[:, None] * stride_x_n
+        + offs_d[None, :] * stride_x_d
+    )
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
+
+    xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
+    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+
+    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), tl.int32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_offsets = k_offsets.to(tl.int64)
+        k_mask = k_offsets < K
+
+        c_ptrs = (
+            c_ptr
+            + pid_b * stride_c_b
+            + k_offsets[None, :] * stride_c_k
+            + offs_d[:, None] * stride_c_d
+        )
+        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
+
+        csq_ptrs = c_sq_ptr + pid_b * stride_csq_b + k_offsets * stride_csq_k
+        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+
+        cross = tl.dot(x_tile, c_tile).to(tl.float32)
+
+        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+        dist = tl.maximum(dist, 0.0)
+        dist = tl.where(k_mask[None, :], dist, 3.4e38)
+
+        curr_min = tl.min(dist, axis=1)
+        curr_idx = tl.argmin(dist, axis=1)
+
+        update = curr_min < best_dist
+        best_dist = tl.where(update, curr_min, best_dist)
+        best_idx = tl.where(update, k_start + curr_idx, best_idx)
+
+    out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
+    tl.store(out_ptrs, best_idx, mask=n_mask)
+
+    tile_inertia = tl.sum(tl.where(n_mask, best_dist, 0.0), axis=0)
+    tl.atomic_add(inertia_ptr + pid_b * stride_inertia_b, tile_inertia)
+
+
+_mini_batch_euclid_assign_kernel_autotuned = triton.autotune(
+    _TUNE_CONFIGS, key=["N", "K"]
+)(_mini_batch_euclid_assign_kernel)
+
 @triton.jit
 def _cosine_assign_kernel(
     x_ptr,                 # *f16 / *f32 [B, N, D]
@@ -548,6 +659,139 @@ def euclid_assign_triton(
             stride_out_n,
         )
     return out
+
+
+def mini_batch_euclid_assign_triton(
+    x: torch.Tensor,
+    centroids: torch.Tensor,
+    x_sq: torch.Tensor,
+    out: torch.Tensor = None,
+    c_sq: torch.Tensor = None,
+    *,
+    BLOCK_N: int = 128,
+    BLOCK_K: int = 128,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
+    config: Optional[dict] = None,
+    use_heuristic: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return nearest-centroid indices and mini-batch inertia using Triton.
+
+    Args:
+        x         : (B, N, D) float16 / float32 (on CUDA)
+        centroids : (B, K, D) same dtype/device as x
+        x_sq      : (B, N)    float32 – ||x||^2 per point (on CUDA)
+        out       : (B, N)    int32   – (option) pre-allocated output tensor (on CUDA)
+        c_sq      : (B, K)    float32 – (option) ||centroids||^2 per centroid (on CUDA)
+
+    Returns:
+        cluster_ids (B, N) int32 (callers can cast to int64 if desired)
+        batch_inertia (B,) float32 sum of squared distances to assigned centroids
+    Extra:
+        config        : {"BLOCK_N","BLOCK_K","num_warps","num_stages"} to force a config
+        use_heuristic : use a fixed heuristic config instead of autotune
+    """
+    assert x.is_cuda and centroids.is_cuda and x_sq.is_cuda, "All tensors must be on CUDA"
+    # assert x.dtype in (torch.float16, torch.float32), "x must be fp16/fp32"
+    assert centroids.dtype == x.dtype, "centroids dtype mismatch"
+
+    B, N, D = x.shape
+    K = centroids.shape[1]
+    assert centroids.shape == (B, K, D), "centroids shape mismatch"
+    assert x_sq.shape == (B, N), "x_sq shape mismatch"
+
+    # x = x.contiguous()
+    # centroids = centroids.contiguous()
+    # x_sq = x_sq.contiguous()
+
+    if out is None:
+        out = torch.empty((B, N), device=x.device, dtype=torch.int32)
+    if c_sq is None:
+        c_sq = (centroids.to(torch.float32) ** 2).sum(-1)
+    batch_inertia = torch.zeros((B,), device=x.device, dtype=torch.float32)
+
+    # Strides (in elements)
+    stride_x_b, stride_x_n, stride_x_d = x.stride()
+    stride_c_b, stride_c_k, stride_c_d = centroids.stride()
+    stride_xsq_b, stride_xsq_n = x_sq.stride()
+    stride_csq_b, stride_csq_k = c_sq.stride()
+    stride_out_b, stride_out_n = out.stride()
+    (stride_inertia_b,) = batch_inertia.stride()
+
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+
+    selected_config = None
+    if config is not None:
+        selected_config = config
+    elif num_warps is not None or num_stages is not None:
+        if num_warps is None or num_stages is None:
+            raise ValueError("num_warps and num_stages must be set together")
+        selected_config = {
+            "BLOCK_N": BLOCK_N,
+            "BLOCK_K": BLOCK_K,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
+    elif use_heuristic:
+        selected_config = _heuristic_euclid_config(N, K, D, device=x.device)
+
+    if selected_config is not None:
+        _mini_batch_euclid_assign_kernel[grid](
+            x,
+            centroids,
+            x_sq,
+            c_sq,
+            out,
+            batch_inertia,
+            B,
+            N,
+            K,
+            D,
+            stride_x_b,
+            stride_x_n,
+            stride_x_d,
+            stride_c_b,
+            stride_c_k,
+            stride_c_d,
+            stride_xsq_b,
+            stride_xsq_n,
+            stride_csq_b,
+            stride_csq_k,
+            stride_out_b,
+            stride_out_n,
+            stride_inertia_b,
+            BLOCK_N=selected_config["BLOCK_N"],
+            BLOCK_K=selected_config["BLOCK_K"],
+            num_warps=selected_config["num_warps"],
+            num_stages=selected_config["num_stages"],
+        )
+    else:
+        _mini_batch_euclid_assign_kernel_autotuned[grid](
+            x,
+            centroids,
+            x_sq,
+            c_sq,
+            out,
+            batch_inertia,
+            B,
+            N,
+            K,
+            D,
+            stride_x_b,
+            stride_x_n,
+            stride_x_d,
+            stride_c_b,
+            stride_c_k,
+            stride_c_d,
+            stride_xsq_b,
+            stride_xsq_n,
+            stride_csq_b,
+            stride_csq_k,
+            stride_out_b,
+            stride_out_n,
+            stride_inertia_b,
+        )
+    return out, batch_inertia
 
 
 def cosine_assign_triton(x: torch.Tensor, centroids: torch.Tensor, out: torch.Tensor = None,

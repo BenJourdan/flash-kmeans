@@ -7,7 +7,7 @@ import torch
 try:
     from flash_kmeans.assign_euclid_triton import euclid_assign_triton
     from flash_kmeans.centroid_update_triton import triton_centroid_update_sorted_euclid
-    from flash_kmeans.kmeans_triton_impl import batch_kmeans_Euclid
+    from flash_kmeans.kmeans_triton_impl import batch_mini_batch_kmeans_Euclid
 
     _HAS_TRITON_IMPL = True
 except Exception:
@@ -18,7 +18,7 @@ def kmeans_largeN(
     x: torch.Tensor,
     n_clusters: int,
     max_iters: int = 100,
-    tol: float = 0.0,
+    tol: Optional[float] = None,
     verbose: bool = False,
     BLOCK_N=1048576,
     init_centroids: Optional[torch.Tensor] = None,
@@ -118,10 +118,10 @@ def kmeans_largeN(
             if verbose:
                 print(f"Iter {it}, center shift: {shift.item():.6f}, time: {time.time() - start_time:.2f}s")
 
-            if shift < tol:
+            if tol is not None and shift < tol:
                 break
 
-            centroids = new_centroids.clone()
+            centroids = new_centroids
 
     return cluster_ids.squeeze(0), new_centroids.squeeze(0)
 
