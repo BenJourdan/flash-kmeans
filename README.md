@@ -35,7 +35,7 @@ x = torch.randn(32, 75600, 128, device="cuda", dtype=torch.float16)
 cluster_ids, centers, _ = batch_kmeans_Euclid(x, n_clusters=1000, tol=1e-4, verbose=True)
 ```
 
-We also provide a API interface similar to `faiss/sklearn`, see [API docs](https://github.com/svg-project/flash-kmeans/blob/main/flash_kmeans/interface.py) for details.
+We also provide estimator-style APIs via `FlashKMeans` and `FlashMiniBatchKMeans`, see [API docs](https://github.com/svg-project/flash-kmeans/blob/main/flash_kmeans/interface.py) for details.
 
 ## Benchmark
 

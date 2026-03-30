@@ -3,6 +3,7 @@ import itertools
 import pytest
 import torch
 
+import flash_kmeans
 import flash_kmeans.interface as interface_mod
 from flash_kmeans.interface import FlashKMeans, FlashMiniBatchKMeans
 
@@ -108,6 +109,57 @@ def _make_model(model_cls, d: int, k: int, seed: int = 0):
         use_triton=False,
         device=torch.device("cpu"),
     )
+
+
+def _allow_minibatch_cpu(monkeypatch):
+    monkeypatch.setattr(interface_mod, "_require_minibatch_backend", lambda device, use_triton: None)
+
+
+def _fake_minibatch_assign(x_b, centroids_b, x_sq, use_heuristic=True):
+    return torch.zeros((x_b.shape[0], x_b.shape[1]), dtype=torch.int64, device=x_b.device)
+
+
+def _make_fake_minibatch_runner(cluster_counts: torch.Tensor, captured: dict | None = None):
+    def fake_run_minibatch(
+        x_b,
+        state,
+        *,
+        mini_batch_size,
+        learning_rate,
+        iterations,
+        epochs,
+        tol,
+        verbose,
+        use_heuristic,
+        generator,
+    ):
+        if captured is not None:
+            captured["x_shape"] = tuple(x_b.shape)
+            captured["n_clusters"] = state.cluster_counts.shape[1]
+            captured["mini_batch_size"] = mini_batch_size
+            captured["epochs"] = epochs
+            captured["iterations"] = iterations
+            captured["learning_rate"] = learning_rate
+            captured["init_cluster_counts"] = state.cluster_counts.detach().cpu().clone()
+            if state.centroids is not None:
+                captured["init_centroids"] = state.centroids.detach().cpu().clone()
+
+        batches_per_epoch = (x_b.shape[1] + mini_batch_size - 1) // mini_batch_size
+        iterations_run = iterations if iterations is not None else epochs * batches_per_epoch
+        epochs_run = epochs if epochs is not None else iterations_run // batches_per_epoch
+
+        state.centroids = None if state.centroids is None else state.centroids.clone()
+        state.cluster_counts = cluster_counts.to(device=x_b.device)
+        state.current_epoch_perm = None
+        state.current_epoch_cursor = 0
+        state.current_epoch_inertia = torch.zeros(x_b.shape[0], device=x_b.device, dtype=torch.float32)
+        state.previous_epoch_inertia = None
+        state.completed_iterations += int(iterations_run)
+        state.completed_epochs += int(epochs_run)
+        state.stopped_early = False
+        return state
+
+    return fake_run_minibatch
 
 
 @pytest.mark.parametrize("model_cls", MODEL_CLASSES, ids=lambda cls: cls.__name__)
@@ -260,31 +312,9 @@ def test_minibatch_fit_forwards_broadcasted_init_centroids(monkeypatch):
     cluster_counts = torch.full((2, 3), 4.0, dtype=torch.float32)
     captured = {}
 
-    def fake_batch_minibatch(
-        x_b,
-        n_clusters,
-        mini_batch_size,
-        epochs,
-        learning_rate,
-        tol,
-        init_centroids,
-        init_cluster_counts,
-        return_cluster_counts,
-        verbose,
-    ):
-        captured["x_shape"] = tuple(x_b.shape)
-        captured["n_clusters"] = n_clusters
-        captured["mini_batch_size"] = mini_batch_size
-        captured["epochs"] = epochs
-        captured["learning_rate"] = learning_rate
-        captured["init_centroids"] = init_centroids.detach().cpu().clone()
-        captured["init_cluster_counts"] = init_cluster_counts
-        captured["return_cluster_counts"] = return_cluster_counts
-        labels = torch.zeros((x_b.shape[0], x_b.shape[1]), dtype=torch.int64, device=x_b.device)
-        return labels, init_centroids.clone(), epochs, cluster_counts.to(device=x_b.device)
-
-    monkeypatch.setattr(interface_mod, "_require_triton_cuda", lambda: None)
-    monkeypatch.setattr(interface_mod, "batch_mini_batch_kmeans_Euclid", fake_batch_minibatch)
+    _allow_minibatch_cpu(monkeypatch)
+    monkeypatch.setattr(interface_mod, "run_mini_batch_training", _make_fake_minibatch_runner(cluster_counts, captured))
+    monkeypatch.setattr(interface_mod, "euclid_assign_triton", _fake_minibatch_assign)
 
     model = FlashMiniBatchKMeans(
         d=data.shape[-1],
@@ -302,16 +332,200 @@ def test_minibatch_fit_forwards_broadcasted_init_centroids(monkeypatch):
     assert captured["n_clusters"] == init_centroids.shape[0]
     assert captured["mini_batch_size"] == 4
     assert captured["epochs"] == 2
+    assert captured["iterations"] is None
     assert captured["learning_rate"] == "adaptive"
     assert captured["init_centroids"].shape == (data.shape[0],) + init_centroids.shape
-    assert captured["init_cluster_counts"] is None
-    assert captured["return_cluster_counts"] is True
+    assert torch.equal(captured["init_cluster_counts"], torch.zeros_like(cluster_counts))
     for batch_idx in range(data.shape[0]):
         assert torch.allclose(captured["init_centroids"][batch_idx], init_centroids)
     assert torch.allclose(model.cluster_counts_b.cpu(), cluster_counts)
 
 
-def test_minibatch_partial_fit_accumulates_cluster_counts_and_steps():
+def test_exact_fit_uses_constructor_tensor_init_when_fit_init_missing(monkeypatch):
+    data = torch.randn(2, 12, 4, generator=torch.Generator().manual_seed(896))
+    init_centroids = torch.randn(3, 4, generator=torch.Generator().manual_seed(897))
+    captured = {}
+
+    def fake_batch_kmeans(x_b, n_clusters, max_iters, tol, init_centroids, verbose):
+        captured["init_centroids"] = init_centroids.detach().cpu().clone()
+        labels = torch.zeros((x_b.shape[0], x_b.shape[1]), dtype=torch.int64, device=x_b.device)
+        return labels, init_centroids.clone(), 1
+
+    monkeypatch.setattr(interface_mod, "_require_triton_cuda", lambda: None)
+    monkeypatch.setattr(interface_mod, "batch_kmeans_Euclid", fake_batch_kmeans)
+
+    model = FlashKMeans(
+        d=data.shape[-1],
+        k=init_centroids.shape[0],
+        niter=1,
+        tol=None,
+        seed=61,
+        init=init_centroids,
+        use_triton=True,
+        device=torch.device("cpu"),
+    )
+    model.fit(data)
+
+    assert captured["init_centroids"].shape == (data.shape[0],) + init_centroids.shape
+    for batch_idx in range(data.shape[0]):
+        assert torch.allclose(captured["init_centroids"][batch_idx], init_centroids)
+    assert model.init_strategy_ == "tensor"
+    assert model.init_time_ms_ == 0.0
+
+
+def test_exact_fit_argument_init_overrides_constructor_init(monkeypatch):
+    data = torch.randn(2, 12, 4, generator=torch.Generator().manual_seed(898))
+    constructor_init = torch.randn(3, 4, generator=torch.Generator().manual_seed(899))
+    fit_init = torch.randn(3, 4, generator=torch.Generator().manual_seed(900))
+    captured = {}
+
+    def fake_batch_kmeans(x_b, n_clusters, max_iters, tol, init_centroids, verbose):
+        captured["init_centroids"] = init_centroids.detach().cpu().clone()
+        labels = torch.zeros((x_b.shape[0], x_b.shape[1]), dtype=torch.int64, device=x_b.device)
+        return labels, init_centroids.clone(), 1
+
+    monkeypatch.setattr(interface_mod, "_require_triton_cuda", lambda: None)
+    monkeypatch.setattr(interface_mod, "batch_kmeans_Euclid", fake_batch_kmeans)
+
+    model = FlashKMeans(
+        d=data.shape[-1],
+        k=constructor_init.shape[0],
+        niter=1,
+        tol=None,
+        seed=63,
+        init=constructor_init,
+        use_triton=True,
+        device=torch.device("cpu"),
+    )
+    model.fit(data, init_centroids=fit_init)
+
+    for batch_idx in range(data.shape[0]):
+        assert torch.allclose(captured["init_centroids"][batch_idx], fit_init)
+
+
+def test_exact_fit_uses_constructor_kmeanspp_init(monkeypatch):
+    data = torch.randn(2, 12, 4, generator=torch.Generator().manual_seed(901))
+    generated_init = torch.randn(2, 3, 4, generator=torch.Generator().manual_seed(902))
+    captured = {}
+
+    def fake_kmeanspp(x_b, n_clusters, seed):
+        captured["kmeanspp_shape"] = tuple(x_b.shape)
+        captured["kmeanspp_seed"] = seed
+        assert n_clusters == generated_init.shape[1]
+        return generated_init.to(device=x_b.device, dtype=x_b.dtype)
+
+    def fake_batch_kmeans(x_b, n_clusters, max_iters, tol, init_centroids, verbose):
+        captured["init_centroids"] = init_centroids.detach().cpu().clone()
+        labels = torch.zeros((x_b.shape[0], x_b.shape[1]), dtype=torch.int64, device=x_b.device)
+        return labels, init_centroids.clone(), 1
+
+    monkeypatch.setattr(interface_mod, "_require_triton_cuda", lambda: None)
+    monkeypatch.setattr(interface_mod, "kmeans_plusplus_init_centroids", fake_kmeanspp)
+    monkeypatch.setattr(interface_mod, "batch_kmeans_Euclid", fake_batch_kmeans)
+
+    model = FlashKMeans(
+        d=data.shape[-1],
+        k=generated_init.shape[1],
+        niter=1,
+        tol=None,
+        seed=67,
+        init="kmeans++",
+        use_triton=True,
+        device=torch.device("cpu"),
+    )
+    model.fit(data)
+
+    assert captured["kmeanspp_shape"] == tuple(data.shape)
+    assert captured["kmeanspp_seed"] == 67
+    assert torch.allclose(captured["init_centroids"], generated_init)
+    assert model.init_strategy_ == "kmeans++"
+    assert model.init_time_ms_ is not None
+    assert model.init_time_ms_ >= 0.0
+
+
+def test_minibatch_fit_uses_constructor_tensor_init_when_fit_init_missing(monkeypatch):
+    data = torch.randn(2, 12, 16, generator=torch.Generator().manual_seed(903))
+    init_centroids = torch.randn(3, 16, generator=torch.Generator().manual_seed(904))
+    cluster_counts = torch.full((2, 3), 2.0, dtype=torch.float32)
+    captured = {}
+
+    _allow_minibatch_cpu(monkeypatch)
+    monkeypatch.setattr(interface_mod, "run_mini_batch_training", _make_fake_minibatch_runner(cluster_counts, captured))
+    monkeypatch.setattr(interface_mod, "euclid_assign_triton", _fake_minibatch_assign)
+
+    model = FlashMiniBatchKMeans(
+        d=data.shape[-1],
+        k=init_centroids.shape[0],
+        mini_batch_size=4,
+        epochs=2,
+        tol=None,
+        seed=71,
+        init=init_centroids,
+        use_triton=True,
+        device=torch.device("cpu"),
+    )
+    model.fit(data)
+
+    assert captured["init_centroids"].shape == (data.shape[0],) + init_centroids.shape
+    for batch_idx in range(data.shape[0]):
+        assert torch.allclose(captured["init_centroids"][batch_idx], init_centroids)
+    assert model.init_strategy_ == "tensor"
+    assert model.init_time_ms_ == 0.0
+
+
+def test_minibatch_constructor_budget_validation():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        FlashMiniBatchKMeans(
+            d=16,
+            k=3,
+            mini_batch_size=4,
+            epochs=1,
+            iterations=1,
+            tol=None,
+            use_triton=False,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="epochs must be a positive integer"):
+        FlashMiniBatchKMeans(
+            d=16,
+            k=3,
+            mini_batch_size=4,
+            epochs=0,
+            tol=None,
+            use_triton=False,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="iterations must be a positive integer"):
+        FlashMiniBatchKMeans(
+            d=16,
+            k=3,
+            mini_batch_size=4,
+            iterations=0,
+            tol=None,
+            use_triton=False,
+            device=torch.device("cpu"),
+        )
+
+    model = FlashMiniBatchKMeans(
+        d=16,
+        k=3,
+        mini_batch_size=4,
+        tol=None,
+        use_triton=False,
+        device=torch.device("cpu"),
+    )
+    assert model.epochs == 100
+    assert model.iterations is None
+
+
+def test_top_level_package_no_longer_exports_low_level_minibatch_function():
+    assert "batch_mini_batch_kmeans_Euclid" not in flash_kmeans.__all__
+    assert not hasattr(flash_kmeans, "batch_mini_batch_kmeans_Euclid")
+
+
+def test_minibatch_partial_fit_accumulates_cluster_counts_and_iterations():
     if not (interface_mod._HAS_TRITON_IMPL and torch.cuda.is_available()):
         pytest.skip("FlashMiniBatchKMeans tests require Triton/CUDA; torch fallback is not implemented.")
 
@@ -327,6 +541,7 @@ def test_minibatch_partial_fit_accumulates_cluster_counts_and_steps():
         use_triton=True,
         device=torch.device("cuda:0"),
     )
+    batches_per_epoch = (data.shape[0] + model.mini_batch_size - 1) // model.mini_batch_size
 
     result = model.partial_fit(data)
     assert result is model
@@ -336,8 +551,11 @@ def test_minibatch_partial_fit_accumulates_cluster_counts_and_steps():
         model.cluster_counts_b.sum(dim=1).cpu(),
         torch.tensor([data.shape[0]], dtype=torch.float32),
     )
-    assert model.n_iter_ == 1
-    assert model.n_steps_ == 4
+    assert model.n_iter_ == batches_per_epoch
+    assert model.n_epochs_ == 1
+    assert model.cluster_ids_b is None
+    assert model.inertia_b is None
+    assert model.inertia_ is None
 
     model.partial_fit(data)
 
@@ -345,9 +563,146 @@ def test_minibatch_partial_fit_accumulates_cluster_counts_and_steps():
         model.cluster_counts_b.sum(dim=1).cpu(),
         torch.tensor([2 * data.shape[0]], dtype=torch.float32),
     )
-    assert model.n_iter_ == 2
-    assert model.n_steps_ == 8
-    assert model.predict(data).shape == (data.shape[0],)
+    assert model.n_iter_ == 2 * batches_per_epoch
+    assert model.n_epochs_ == 2
+    predicted = model.predict(data)
+    assert predicted.shape == (data.shape[0],)
+    assert model.cluster_ids_b is None
+    assert model.inertia_b is None
+    assert model.inertia_ is None
+
+
+def test_minibatch_iteration_budget_only_increments_epoch_counter_at_epoch_boundary():
+    if not (interface_mod._HAS_TRITON_IMPL and torch.cuda.is_available()):
+        pytest.skip("FlashMiniBatchKMeans tests require Triton/CUDA; torch fallback is not implemented.")
+
+    data, _, centers = _make_separated_blobs(d=16)
+    model = FlashMiniBatchKMeans(
+        d=data.shape[-1],
+        k=centers.shape[0],
+        mini_batch_size=32,
+        learning_rate="classic",
+        iterations=1,
+        tol=None,
+        seed=79,
+        use_triton=True,
+        device=torch.device("cuda:0"),
+    )
+    batches_per_epoch = (data.shape[0] + model.mini_batch_size - 1) // model.mini_batch_size
+
+    model.partial_fit(data)
+
+    assert model.n_iter_ == 1
+    assert model.n_epochs_ == 0
+    assert model.cluster_counts_b is not None
+    assert torch.allclose(
+        model.cluster_counts_b.sum(dim=1).cpu(),
+        torch.tensor([32.0], dtype=torch.float32),
+    )
+    assert model.cluster_ids_b is None
+    assert model.inertia_b is None
+    assert model.inertia_ is None
+
+    for _ in range(batches_per_epoch - 1):
+        model.partial_fit(data)
+
+    assert model.n_iter_ == batches_per_epoch
+    assert model.n_epochs_ == 1
+    assert torch.allclose(
+        model.cluster_counts_b.sum(dim=1).cpu(),
+        torch.tensor([data.shape[0]], dtype=torch.float32),
+    )
+
+
+def test_minibatch_partial_fit_iteration_chunking_matches_single_budgeted_call():
+    if not (interface_mod._HAS_TRITON_IMPL and torch.cuda.is_available()):
+        pytest.skip("FlashMiniBatchKMeans tests require Triton/CUDA; torch fallback is not implemented.")
+
+    data, _, centers = _make_separated_blobs(d=16)
+    init_centroids = data[:centers.shape[0]].clone()
+    mini_batch_size = 32
+    iterations = ((data.shape[0] + mini_batch_size - 1) // mini_batch_size) + 1
+    stepwise = FlashMiniBatchKMeans(
+        d=data.shape[-1],
+        k=centers.shape[0],
+        mini_batch_size=mini_batch_size,
+        learning_rate="classic",
+        iterations=1,
+        tol=None,
+        seed=83,
+        use_triton=True,
+        device=torch.device("cuda:0"),
+    )
+    budgeted = FlashMiniBatchKMeans(
+        d=data.shape[-1],
+        k=centers.shape[0],
+        mini_batch_size=mini_batch_size,
+        learning_rate="classic",
+        iterations=iterations,
+        tol=None,
+        seed=83,
+        use_triton=True,
+        device=torch.device("cuda:0"),
+    )
+
+    for _ in range(iterations):
+        if stepwise.centroids_b is None:
+            stepwise.partial_fit(data, init_centroids=init_centroids)
+        else:
+            stepwise.partial_fit(data)
+    budgeted.partial_fit(data, init_centroids=init_centroids)
+
+    assert torch.equal(stepwise.predict(data), budgeted.predict(data))
+    assert torch.allclose(stepwise.centroids_b, budgeted.centroids_b)
+    assert torch.allclose(stepwise.cluster_counts_b, budgeted.cluster_counts_b)
+    assert stepwise.n_iter_ == budgeted.n_iter_
+    assert stepwise.n_epochs_ == budgeted.n_epochs_
+    assert stepwise.stopped_early_ == budgeted.stopped_early_
+    assert stepwise.cluster_ids_b is None
+    assert budgeted.cluster_ids_b is None
+
+
+def test_minibatch_fit_iteration_budget_matches_one_epoch_fit():
+    if not (interface_mod._HAS_TRITON_IMPL and torch.cuda.is_available()):
+        pytest.skip("FlashMiniBatchKMeans tests require Triton/CUDA; torch fallback is not implemented.")
+
+    data, _, centers = _make_separated_blobs(d=16)
+    init_centroids = data[:centers.shape[0]].clone()
+    mini_batch_size = 32
+    batches_per_epoch = (data.shape[0] + mini_batch_size - 1) // mini_batch_size
+    steps_model = FlashMiniBatchKMeans(
+        d=data.shape[-1],
+        k=centers.shape[0],
+        mini_batch_size=mini_batch_size,
+        learning_rate="classic",
+        iterations=batches_per_epoch,
+        tol=None,
+        seed=89,
+        use_triton=True,
+        device=torch.device("cuda:0"),
+    )
+    epochs_model = FlashMiniBatchKMeans(
+        d=data.shape[-1],
+        k=centers.shape[0],
+        mini_batch_size=mini_batch_size,
+        learning_rate="classic",
+        epochs=1,
+        tol=None,
+        seed=89,
+        use_triton=True,
+        device=torch.device("cuda:0"),
+    )
+
+    steps_model.fit(data, init_centroids=init_centroids)
+    epochs_model.fit(data, init_centroids=init_centroids)
+
+    assert torch.equal(steps_model.cluster_ids_b, epochs_model.cluster_ids_b)
+    assert torch.allclose(steps_model.centroids_b, epochs_model.centroids_b)
+    assert torch.allclose(steps_model.cluster_counts_b, epochs_model.cluster_counts_b)
+    assert steps_model.n_iter_ == batches_per_epoch
+    assert steps_model.n_epochs_ == 1
+    assert steps_model.n_iter_ == epochs_model.n_iter_
+    assert steps_model.n_epochs_ == epochs_model.n_epochs_
 
 
 def test_minibatch_partial_fit_rejects_reinitialization_after_fit():
@@ -373,7 +728,7 @@ def test_minibatch_partial_fit_rejects_reinitialization_after_fit():
         model.partial_fit(data, init_centroids=init_centroids)
 
 
-def test_minibatch_batched_partial_fit_tracks_counts_and_inertia():
+def test_minibatch_batched_partial_fit_tracks_counts_and_lazy_state():
     if not (interface_mod._HAS_TRITON_IMPL and torch.cuda.is_available()):
         pytest.skip("FlashMiniBatchKMeans tests require Triton/CUDA; torch fallback is not implemented.")
 
@@ -398,12 +753,122 @@ def test_minibatch_batched_partial_fit_tracks_counts_and_inertia():
         model.cluster_counts_b.sum(dim=1).cpu(),
         torch.full((2,), data.shape[1], dtype=torch.float32),
     )
-    assert model.inertia_b is not None
-    assert model.inertia_b.shape == (2,)
+    assert model.cluster_ids_b is None
+    assert model.inertia_b is None
+    assert model.inertia_ is None
     assert model.predict(data).shape == (2, data.shape[1])
+    assert model.cluster_ids_b is None
 
 
-def test_minibatch_partial_fit_updates_inertia_attributes():
+def test_minibatch_set_training_budget_switches_between_epochs_and_iterations():
+    model = FlashMiniBatchKMeans(
+        d=4,
+        k=3,
+        mini_batch_size=8,
+        epochs=2,
+        tol=None,
+        use_triton=False,
+        device=torch.device("cpu"),
+    )
+
+    assert model.epochs == 2
+    assert model.iterations is None
+
+    model.set_training_budget(iterations=7)
+
+    assert model.epochs is None
+    assert model.iterations == 7
+
+
+def test_minibatch_reset_online_progress_preserves_centroids_and_counts(monkeypatch):
+    _allow_minibatch_cpu(monkeypatch)
+
+    cluster_counts = torch.tensor([[12.0, 20.0]], dtype=torch.float32)
+    monkeypatch.setattr(interface_mod, "run_mini_batch_training", _make_fake_minibatch_runner(cluster_counts))
+
+    data = torch.randn(10, 4)
+    init_centroids = torch.randn(2, 4)
+    model = FlashMiniBatchKMeans(
+        d=data.shape[-1],
+        k=2,
+        mini_batch_size=8,
+        iterations=2,
+        tol=None,
+        use_triton=False,
+        device=torch.device("cpu"),
+    )
+
+    model.partial_fit(data, init_centroids=init_centroids)
+    model._training_state.current_epoch_perm = torch.arange(data.shape[0], dtype=torch.long)
+    model._training_state.current_epoch_cursor = 6
+    model._training_state.current_epoch_inertia = torch.ones(1, dtype=torch.float32)
+    model._training_state.previous_epoch_inertia = torch.ones(1, dtype=torch.float32)
+    model._training_state.previous_batch_inertia = torch.ones(1, dtype=torch.float32)
+    model._training_state.completed_epochs = 4
+    model._training_state.completed_iterations = 9
+    model.n_epochs_ = 4
+    model.n_iter_ = 9
+    model.last_fit_n_epochs_ = 3
+    model.last_fit_n_iter_ = 5
+    model.stopped_early_ = True
+
+    centroids_before = model.centroids_b.clone()
+    counts_before = model.cluster_counts_b.clone()
+
+    model.reset_online_progress()
+
+    assert torch.equal(model.centroids_b, centroids_before)
+    assert torch.equal(model.cluster_counts_b, counts_before)
+    assert model._training_state.current_epoch_perm is None
+    assert model._training_state.current_epoch_cursor == 0
+    assert torch.equal(model._training_state.current_epoch_inertia, torch.zeros(1, dtype=torch.float32))
+    assert model._training_state.previous_epoch_inertia is None
+    assert model._training_state.previous_batch_inertia is None
+    assert model._training_state.completed_epochs == 4
+    assert model._training_state.completed_iterations == 9
+    assert model.n_epochs_ == 4
+    assert model.n_iter_ == 9
+    assert model.last_fit_n_epochs_ == 0
+    assert model.last_fit_n_iter_ == 0
+    assert model.stopped_early_ is False
+
+
+def test_minibatch_reset_online_progress_can_clear_cluster_counts(monkeypatch):
+    _allow_minibatch_cpu(monkeypatch)
+
+    cluster_counts = torch.tensor([[12.0, 20.0]], dtype=torch.float32)
+    monkeypatch.setattr(interface_mod, "run_mini_batch_training", _make_fake_minibatch_runner(cluster_counts))
+
+    data = torch.randn(10, 4)
+    init_centroids = torch.randn(2, 4)
+    model = FlashMiniBatchKMeans(
+        d=data.shape[-1],
+        k=2,
+        mini_batch_size=8,
+        iterations=2,
+        tol=None,
+        use_triton=False,
+        device=torch.device("cpu"),
+    )
+
+    model.partial_fit(data, init_centroids=init_centroids)
+    model._training_state.completed_epochs = 4
+    model._training_state.completed_iterations = 9
+    model.n_epochs_ = 4
+    model.n_iter_ = 9
+
+    model.reset_online_progress(reset_counters=True, reset_cluster_counts=True)
+
+    assert torch.equal(model.centroids_b, model._training_state.centroids)
+    assert torch.equal(model.cluster_counts_b, torch.zeros_like(cluster_counts))
+    assert torch.equal(model._training_state.cluster_counts, torch.zeros_like(cluster_counts))
+    assert model._training_state.completed_epochs == 0
+    assert model._training_state.completed_iterations == 0
+    assert model.n_epochs_ == 0
+    assert model.n_iter_ == 0
+
+
+def test_minibatch_fit_restores_full_state_after_partial_fit():
     if not (interface_mod._HAS_TRITON_IMPL and torch.cuda.is_available()):
         pytest.skip("FlashMiniBatchKMeans tests require Triton/CUDA; torch fallback is not implemented.")
 
@@ -421,12 +886,14 @@ def test_minibatch_partial_fit_updates_inertia_attributes():
     )
 
     model.partial_fit(data)
-    first_inertia = float(model.inertia_)
+    assert model.cluster_ids_b is None
+    assert model.inertia_b is None
+    assert model.inertia_ is None
 
+    model.fit(data)
+
+    assert model.cluster_ids_b is not None
+    assert model.cluster_ids_b.shape == (1, data.shape[0])
     assert model.inertia_b is not None
     assert model.inertia_b.shape == (1,)
-
-    model.partial_fit(data, epochs=3)
-    second_inertia = float(model.inertia_)
-
-    assert second_inertia <= first_inertia + 1e-5
+    assert model.inertia_ is not None

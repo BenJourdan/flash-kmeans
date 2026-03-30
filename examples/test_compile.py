@@ -11,7 +11,7 @@ import time
 
 def _measure_worker(n: int, d: int, k: int, rounds: int, dtype: str, use_heuristic: bool):
     import torch
-    from flash_kmeans import batch_mini_batch_kmeans_Euclid
+    from flash_kmeans import FlashMiniBatchKMeans
 
     dtype_map = {"fp16": torch.float16, "fp32": torch.float32}
     torch_dtype = dtype_map[dtype]
@@ -19,18 +19,22 @@ def _measure_worker(n: int, d: int, k: int, rounds: int, dtype: str, use_heurist
     torch.manual_seed(0)
     B = 1
     x = torch.randn(B, n, d, device="cuda", dtype=torch_dtype)
+    model = FlashMiniBatchKMeans(
+        d=d,
+        k=k,
+        mini_batch_size=n,
+        iterations=1,
+        tol=0.0,
+        seed=0,
+        use_triton=True,
+        use_heuristic=use_heuristic,
+        dtype=torch_dtype,
+        device=torch.device("cuda:0"),
+    )
 
     torch.cuda.synchronize()
     start_time = time.time()
-    cluster_ids, centers, _ = batch_mini_batch_kmeans_Euclid(
-        x,
-        n_clusters=k,
-        tol=0.0,
-        init_centroids=None,
-        verbose=False,
-        max_iters=1,
-        use_heuristic=use_heuristic,
-    )
+    model.partial_fit(x)
     torch.cuda.synchronize()
     compile_s = time.time() - start_time
 
@@ -38,15 +42,7 @@ def _measure_worker(n: int, d: int, k: int, rounds: int, dtype: str, use_heurist
     end_evt = torch.cuda.Event(enable_timing=True)
     start_evt.record()
     for _ in range(rounds):
-        cluster_ids, centers, _ = batch_mini_batch_kmeans_Euclid(
-            x,
-            n_clusters=k,
-            tol=0.0,
-            init_centroids=centers,
-            verbose=False,
-            max_iters=1,
-            use_heuristic=use_heuristic,
-        )
+        model.partial_fit(x)
     end_evt.record()
     torch.cuda.synchronize()
     iter_ms = start_evt.elapsed_time(end_evt) / rounds

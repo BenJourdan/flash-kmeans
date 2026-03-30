@@ -1,5 +1,5 @@
 import torch
-from flash_kmeans import batch_mini_batch_kmeans_Euclid, batch_kmeans_Cosine
+from flash_kmeans import batch_kmeans_Euclid, batch_kmeans_Cosine
 from flash_kmeans.centroid_update_triton import triton_centroid_update_euclid, triton_centroid_update_cosine
 from flash_kmeans.torch_fallback import batch_kmeans_Euclid_torch_native
 import time
@@ -111,7 +111,7 @@ def batch_kmeans_Cosine_torch(x, n_clusters, max_iters=100, tol=0.0, init_centro
 
 def _make_flash_euclid(use_heuristic: bool):
     def _fn(x, n_clusters, max_iters=100, tol=0.0, init_centroids=None, verbose=False):
-        return batch_mini_batch_kmeans_Euclid(
+        return batch_kmeans_Euclid(
             x,
             n_clusters,
             max_iters=max_iters,
@@ -122,7 +122,7 @@ def _make_flash_euclid(use_heuristic: bool):
         )
 
     suffix = "heuristic" if use_heuristic else "autotune"
-    _fn.__name__ = f"batch_kmeans_Euclid_{suffix}"
+    _fn.__name__ = f"batch_kmeans_Euclid_flash_{suffix}"
     return _fn
 
 
@@ -257,4 +257,3 @@ if __name__ == "__main__":
         raise ValueError("Invalid distance mode")
 
     benchmark_kmeans_all(b, n, d, k, kmeans_func_list, max_iters=max_iters, tol=tol, output_file=args.output_file)
-

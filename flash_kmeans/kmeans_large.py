@@ -7,7 +7,6 @@ import torch
 try:
     from flash_kmeans.assign_euclid_triton import euclid_assign_triton
     from flash_kmeans.centroid_update_triton import triton_centroid_update_sorted_euclid
-    from flash_kmeans.kmeans_triton_impl import batch_mini_batch_kmeans_Euclid
 
     _HAS_TRITON_IMPL = True
 except Exception:

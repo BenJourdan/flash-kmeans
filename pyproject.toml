@@ -25,6 +25,8 @@ dependencies = [
   "numpy",
   "tqdm",
   "pytest>=8.3.5",
+  "scikit-learn>=1.3.2",
+  "matplotlib>=3.7.5",
 ]
 
 [project.urls]

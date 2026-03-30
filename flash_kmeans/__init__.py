@@ -1,9 +1,13 @@
 from .interface import FlashKMeans, FlashMiniBatchKMeans
+from .initialization import (
+    kmeans_parallel_init_centroids,
+    kmeans_plusplus_init_centroids,
+    sample_random_init_centroids,
+)
 
 try:
     from .kmeans_triton_impl import (
         batch_kmeans_Euclid,
-        batch_mini_batch_kmeans_Euclid,
         batch_kmeans_Cosine,
         batch_kmeans_Dot,
     )
@@ -29,7 +33,6 @@ except Exception:
     triton_centroid_update_euclid = no_torch_fallback
     triton_centroid_update_sorted_euclid = no_torch_fallback
     batch_kmeans_Euclid = batch_kmeans_Euclid_torch_native
-    batch_mini_batch_kmeans_Euclid = no_torch_fallback
     batch_kmeans_Cosine = no_torch_fallback
     batch_kmeans_Dot = no_torch_fallback
     kmeans_largeN_assign = no_torch_fallback
@@ -37,13 +40,15 @@ except Exception:
 
 __all__ = [
     "batch_kmeans_Euclid",
-    "batch_mini_batch_kmeans_Euclid",
     "batch_kmeans_Cosine",
     "batch_kmeans_Dot",
     "triton_centroid_update_euclid",
     "triton_centroid_update_sorted_euclid",
     "FlashKMeans",
     "FlashMiniBatchKMeans",
+    "sample_random_init_centroids",
+    "kmeans_plusplus_init_centroids",
+    "kmeans_parallel_init_centroids",
     "kmeans_largeN",
     "kmeans_largeN_assign",
 ]
